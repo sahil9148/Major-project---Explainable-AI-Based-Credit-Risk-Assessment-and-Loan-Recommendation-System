@@ -294,10 +294,10 @@ async def predict(applicant: ApplicantData) -> RiskAssessment:
 
     counterfactuals = find_counterfactuals(
         model=model,
-        feature_columns=feature_columns,
-        applicant_row=raw,
+        X_base=X,
         current_tier=tier,
     )
+
     narrative = generate_narrative(
         risk_score=risk_score,
         risk_tier=tier,

@@ -1,27 +1,30 @@
-"""
+﻿"""
 counterfactual.py
 ------------------
 "What would it take?" search: given a scored applicant, find the smallest
 realistic change to *actionable* features that would move them to a better
-risk tier. This is what turns the system from "here's why you were denied"
-into "here's what to do about it" -- the difference between descriptive
-and actionable explainability.
+risk tier.
 
 Deliberately excludes features an applicant can't realistically act on in
 the short term (age, past defaults, income) and only searches features
 where "do less of this" is legitimate, achievable financial advice.
+
+Performance note. This runs 5 independent binary searches per request
+(one per actionable feature, plus one combined search). Profiling showed
+XGBoost's predict_proba() has ~4-6ms of *fixed* per-call overhead that's
+almost independent of batch size (60 rows in one call costs about the
+same as 1 row). So all 5 searches run in lockstep: at each of the 12
+bisection rounds, one 5-row batch (one candidate per search) is scored in
+a single predict_proba() call, instead of 5 separate calls.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import pandas as pd
 
-from preprocessing import build_model_matrix
-
-# Features we're willing to suggest changing. Order is just the order
-# single-feature suggestions are attempted in.
 ACTIONABLE_FEATURES: list[str] = [
     "credit_utilization_rate",
     "debt_to_income_ratio",
@@ -29,8 +32,6 @@ ACTIONABLE_FEATURES: list[str] = [
     "num_credit_inquiries_last_6m",
 ]
 
-# We won't suggest reducing a feature below this floor even if the search
-# would technically keep improving the score.
 FEATURE_FLOORS = {
     "credit_utilization_rate": 0.05,
     "debt_to_income_ratio": 0.02,
@@ -39,6 +40,7 @@ FEATURE_FLOORS = {
 }
 
 _TIER_RANK = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "VERY_HIGH": 3}
+SEARCH_ITERATIONS = 12
 
 
 def _tier_from_score(score: float) -> str:
@@ -49,11 +51,6 @@ def _tier_from_score(score: float) -> str:
     if score < 0.70:
         return "HIGH"
     return "VERY_HIGH"
-
-
-def _score_for(model, feature_columns: list[str], row: pd.DataFrame) -> float:
-    X, _ = build_model_matrix(row, feature_columns=feature_columns)
-    return float(model.predict_proba(X)[0, 1])
 
 
 @dataclass
@@ -80,123 +77,120 @@ def _describe(feature: str, current: float, suggested: float, new_tier: str) -> 
     )
 
 
-def _search_single_feature(
-    model,
-    feature_columns: list[str],
-    base_row: pd.DataFrame,
-    feature: str,
-    current_tier: str,
-) -> "Counterfactual | None":
-    """Binary-search a reduction in `feature` for the smallest change that
-    improves the applicant by at least one risk tier."""
-    current_value = float(base_row.iloc[0][feature])
-    floor = FEATURE_FLOORS.get(feature, 0.0)
-    if current_value <= floor:
-        return None
-
-    lo, hi = floor, current_value  # invariant: lo improves (if anything does), hi does not
-    best = None
-
-    trial = base_row.copy()
-    trial[feature] = trial[feature].astype(float)  # binary search needs fractional
-    # midpoints even for integer-valued columns like num_credit_inquiries_last_6m --
-    # without this cast, pandas silently (soon: not-so-silently) truncates them.
-
-    for _ in range(20):  # 20 bisections is far more precision than this advice needs
-        mid = (lo + hi) / 2
-        trial.at[trial.index[0], feature] = mid
-        score = _score_for(model, feature_columns, trial)
-        tier = _tier_from_score(score)
-        if _TIER_RANK[tier] < _TIER_RANK[current_tier]:
-            best = (mid, score, tier)
-            lo = mid  # this works -- see if an even smaller change also works
-        else:
-            hi = mid  # doesn't work yet -- need more reduction
-
-    if best is None:
-        return None
-
-    suggested_value, new_score, new_tier = best
-    return Counterfactual(
-        feature=feature,
-        current_value=round(current_value, 4),
-        suggested_value=round(suggested_value, 4),
-        new_risk_score=round(new_score, 5),
-        new_tier=new_tier,
-        description=_describe(feature, current_value, suggested_value, new_tier),
+def _describe_combined(fraction: float, new_tier: str) -> str:
+    pct = round(fraction * 100)
+    return (
+        f"A {pct}% reduction spread across utilization, debt-to-income, "
+        f"loan amount, and recent inquiries together would move this "
+        f"applicant to {new_tier} risk -- often more realistic than one "
+        f"large single change."
     )
 
 
-def _search_combined(
-    model,
-    feature_columns: list[str],
-    base_row: pd.DataFrame,
-    current_tier: str,
-) -> "Counterfactual | None":
-    """One 'balanced' suggestion: shrink every actionable feature by the
-    same percentage simultaneously. Often more realistic advice than one
-    large single-feature change."""
-    current_values = {f: float(base_row.iloc[0][f]) for f in ACTIONABLE_FEATURES}
+class _SearchState:
+    def __init__(self, name: str, kind: Literal["single", "combined"], lo: float, hi: float):
+        self.name = name
+        self.kind = kind
+        self.lo = lo
+        self.hi = hi
+        self.best: tuple[float, float, str] | None = None
 
-    lo, hi = 0.0, 1.0  # fraction to reduce every actionable feature by
-    best = None
+    def candidate(self) -> float:
+        return (self.lo + self.hi) / 2
 
-    trial = base_row.copy()
-    for f in ACTIONABLE_FEATURES:
-        trial[f] = trial[f].astype(float)
+    def update(self, mid: float, score: float, current_tier: str) -> None:
+        tier = _tier_from_score(score)
+        improved = _TIER_RANK[tier] < _TIER_RANK[current_tier]
+        if improved:
+            self.best = (mid, score, tier)
+        if self.kind == "single":
+            if improved:
+                self.lo = mid
+            else:
+                self.hi = mid
+        else:
+            if improved:
+                self.hi = mid
+            else:
+                self.lo = mid
 
-    for _ in range(20):
-        mid = (lo + hi) / 2
+
+def _apply_candidate(template: pd.DataFrame, state: "_SearchState", mid: float, combined_current: dict) -> pd.DataFrame:
+    row = template.copy()
+    if state.kind == "single":
+        row.at[row.index[0], state.name] = mid
+    else:
         for f in ACTIONABLE_FEATURES:
             floor = FEATURE_FLOORS.get(f, 0.0)
-            trial.at[trial.index[0], f] = max(current_values[f] * (1 - mid), floor)
-        score = _score_for(model, feature_columns, trial)
-        tier = _tier_from_score(score)
-        if _TIER_RANK[tier] < _TIER_RANK[current_tier]:
-            best = (mid, score, tier)
-            hi = mid  # this works -- see if a smaller combined change also works
-        else:
-            lo = mid
-
-    if best is None:
-        return None
-
-    fraction, new_score, new_tier = best
-    pct = round(fraction * 100)
-    return Counterfactual(
-        feature="combined",
-        current_value=0.0,
-        suggested_value=fraction,
-        new_risk_score=round(new_score, 5),
-        new_tier=new_tier,
-        description=(
-            f"A {pct}% reduction spread across utilization, debt-to-income, "
-            f"loan amount, and recent inquiries together would move this "
-            f"applicant to {new_tier} risk -- often more realistic than one "
-            f"large single change."
-        ),
-    )
+            row.at[row.index[0], f] = max(combined_current[f] * (1 - mid), floor)
+    return row
 
 
 def find_counterfactuals(
     model,
-    feature_columns: list[str],
-    applicant_row: pd.DataFrame,
+    X_base: pd.DataFrame,
     current_tier: str,
     max_suggestions: int = 3,
 ) -> list[Counterfactual]:
+    """`X_base` is the already one-hot-encoded, feature_columns-aligned row
+    for this applicant -- pass the same frame already built for the main
+    prediction rather than raw applicant data, so this doesn't redundantly
+    re-encode it."""
     if current_tier == "LOW":
-        return []  # already the best tier -- nothing to suggest
+        return []
+
+    template = X_base.copy()
+    for f in ACTIONABLE_FEATURES:
+        template[f] = template[f].astype(float)
+
+    combined_current = {f: float(X_base.iloc[0][f]) for f in ACTIONABLE_FEATURES}
+
+    searches: list[_SearchState] = []
+    for feature in ACTIONABLE_FEATURES:
+        current_value = float(X_base.iloc[0][feature])
+        floor = FEATURE_FLOORS.get(feature, 0.0)
+        if current_value > floor:
+            searches.append(_SearchState(feature, "single", floor, current_value))
+    searches.append(_SearchState("combined", "combined", 0.0, 1.0))
+
+    for _ in range(SEARCH_ITERATIONS):
+        mids = [s.candidate() for s in searches]
+        batch = pd.concat(
+            [_apply_candidate(template, s, mid, combined_current) for s, mid in zip(searches, mids)],
+            ignore_index=True,
+        )
+        scores = model.predict_proba(batch)[:, 1]
+        for s, mid, score in zip(searches, mids, scores):
+            s.update(mid, float(score), current_tier)
 
     suggestions: list[Counterfactual] = []
-    for feature in ACTIONABLE_FEATURES:
-        cf = _search_single_feature(model, feature_columns, applicant_row, feature, current_tier)
-        if cf is not None:
-            suggestions.append(cf)
-
-    combined = _search_combined(model, feature_columns, applicant_row, current_tier)
-    if combined is not None:
-        suggestions.append(combined)
+    for s in searches:
+        if s.best is None:
+            continue
+        value, score, tier = s.best
+        if s.kind == "single":
+            current_value = float(X_base.iloc[0][s.name])
+            suggestions.append(
+                Counterfactual(
+                    feature=s.name,
+                    current_value=round(current_value, 4),
+                    suggested_value=round(value, 4),
+                    new_risk_score=round(score, 5),
+                    new_tier=tier,
+                    description=_describe(s.name, current_value, value, tier),
+                )
+            )
+        else:
+            suggestions.append(
+                Counterfactual(
+                    feature="combined",
+                    current_value=0.0,
+                    suggested_value=round(value, 4),
+                    new_risk_score=round(score, 5),
+                    new_tier=tier,
+                    description=_describe_combined(value, tier),
+                )
+            )
 
     def relative_change(cf: Counterfactual) -> float:
         if cf.feature == "combined":
@@ -205,5 +199,5 @@ def find_counterfactuals(
             return 1.0
         return abs(cf.current_value - cf.suggested_value) / cf.current_value
 
-    suggestions.sort(key=relative_change)  # smallest, easiest changes first
+    suggestions.sort(key=relative_change)
     return suggestions[:max_suggestions]
